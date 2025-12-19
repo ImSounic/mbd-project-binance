@@ -1,10 +1,11 @@
-# data / outputs
+# data / outputs (never commit)
 data/
 output/
 results/
 *.parquet
 *.csv
 *.tsv
+*.json
 
 # python
 __pycache__/
@@ -17,6 +18,3 @@ __pycache__/
 *.log
 spark-warehouse/
 metastore_db/
-
-# OS
-.DS_Store
