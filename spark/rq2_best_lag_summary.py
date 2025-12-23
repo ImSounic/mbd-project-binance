@@ -1,8 +1,7 @@
 # spark/rq2_best_lag_summary.py
 
 import os
-from pyspark.sql import functions as F, Window
-from spark.config import ensure_spark, derived_path
+from pyspark.sql import SparkSession, functions as F, Window
 
 # -------------------- CONFIG --------------------
 MIN_SHOCK_OBS = int(os.environ.get("MIN_SHOCK_OBS", "200"))
