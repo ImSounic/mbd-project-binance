@@ -22,3 +22,7 @@ metastore_db/
 # local dataset (never commit)
 binance-dataset/
 **/*.parquet
+
+# Derived outputs
+data/derived/
+data/results/
