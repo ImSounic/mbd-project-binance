@@ -5,13 +5,10 @@ RQ2 Summary: Best lag + typical lag distribution
 Input (produced by rq2_shock_propagation.py):
   - {derived_base}/rq2_results/lag_effects   (parquet)
 
-Your current schema includes:
-  symbol, lag_min, delta_vol, delta_illiq, n_shock_obs, ...
-
 This script:
   1) normalizes lag_min -> lag
   2) picks best lag per symbol (max delta_vol / max delta_illiq)
-  3) outputs parquet + CSV summaries (report-friendly)
+  3) writes parquet + single-CSV folders (coalesce(1)) for report use
 """
 
 import os
@@ -35,13 +32,24 @@ def ensure_spark(app_name: str) -> SparkSession:
     return spark
 
 
+def write_parquet_and_csv(df, out_base: str):
+    """
+    Write:
+      - parquet to out_base
+      - single CSV file to out_base_csv (Spark writes CSV as a folder)
+    """
+    df.write.mode("overwrite").parquet(out_base)
+    df.coalesce(1).write.mode("overwrite").option("header", True).csv(out_base + "_csv")
+
+
 def best_by_metric(df, metric_col: str):
     """
     For each symbol:
-      - choose lag that maximizes metric_col (e.g., delta_vol)
-      - tie-breaker: smaller lag (faster propagation)
+      - choose lag that maximizes metric_col (delta_vol or delta_illiq)
+      - tie-breaker: smaller lag
 
-    Returns one row per symbol.
+    Output columns:
+      symbol, lag, delta_vol, delta_illiq, n_shock_obs, best_metric, best_metric_name
     """
     w = Window.partitionBy("symbol").orderBy(F.col(metric_col).desc(), F.col("lag").asc())
 
@@ -51,25 +59,21 @@ def best_by_metric(df, metric_col: str):
           .drop("rn")
     )
 
-    # Keep only what we need (IMPORTANT: don't include metric_col twice!)
-    base_cols = ["symbol", "lag", metric_col, "delta_vol", "delta_illiq", "n_shock_obs"]
+    # Keep a clean set of columns (no duplicates possible)
+    core_cols = ["symbol", "lag", "delta_vol", "delta_illiq", "n_shock_obs"]
     optional = ["vol_on_shock", "vol_on_noshock", "illiq_on_shock", "illiq_on_noshock", "n_noshock_obs"]
-    cols = base_cols + [c for c in optional if c in best.columns]
-
+    cols = core_cols + [c for c in optional if c in best.columns]
     best = best.select(*cols)
 
-    # Rename the chosen metric for clarity
-    best_metric_name = f"best_{metric_col}"
-    best = best.withColumnRenamed(metric_col, best_metric_name)
+    # Add stable “best metric” columns without renaming anything
+    best = best.withColumn("best_metric", F.col(metric_col)) \
+               .withColumn("best_metric_name", F.lit(metric_col))
 
-    return best.orderBy(F.col(best_metric_name).desc(), F.col("lag").asc())
+    return best.orderBy(F.col("best_metric").desc(), F.col("lag").asc())
 
 
 def typical_lag_stats(best_vol, best_illiq):
-    """
-    Typical lag stats across symbols:
-      mean/median/p25/p75 of the selected best lag.
-    """
+    """Typical lag stats across symbols for each metric."""
     def stats_for(best_df, label: str):
         return (
             best_df.agg(
@@ -96,16 +100,6 @@ def best_lag_hist(best_df, label: str):
     )
 
 
-def write_parquet_and_csv(df, out_base: str):
-    """
-    Write:
-      - parquet to out_base
-      - single CSV file to out_base_csv (coalesce(1))
-    """
-    df.write.mode("overwrite").parquet(out_base)
-    df.coalesce(1).write.mode("overwrite").option("header", True).csv(out_base + "_csv")
-
-
 def main():
     derived_base = _get_derived_base()
     in_path = f"{derived_base}/rq2_results/lag_effects"
@@ -116,34 +110,34 @@ def main():
     print("Reading RQ2 lag effects from:", in_path)
     df = spark.read.parquet(in_path)
 
-    # ---- Normalize lag column name ----
+    # Normalize lag column
     if "lag" not in df.columns:
         if "lag_min" in df.columns:
             df = df.withColumnRenamed("lag_min", "lag")
         else:
             raise ValueError(f"Missing lag column: expected 'lag' or 'lag_min'. Found: {df.columns}")
 
-    # ---- Validate required columns ----
+    # Validate required columns
     needed = {"symbol", "lag", "delta_vol", "delta_illiq", "n_shock_obs"}
     missing = [c for c in needed if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns in lag_effects: {missing}. Found: {df.columns}")
 
-    # ---- Filter unstable estimates ----
+    # Filter unstable estimates
     MIN_SHOCK_OBS = int(os.environ.get("MIN_SHOCK_OBS", "200"))
     df = df.filter(F.col("n_shock_obs") >= F.lit(MIN_SHOCK_OBS))
     print(f"Keeping rows with n_shock_obs >= {MIN_SHOCK_OBS}")
 
-    # ---- Best lag per symbol (two perspectives) ----
+    # Best lag per symbol for each metric
     best_vol = best_by_metric(df, "delta_vol")
     best_illiq = best_by_metric(df, "delta_illiq")
 
-    # ---- Typical lag stats + histograms ----
+    # Typical lag stats + histograms
     stats = typical_lag_stats(best_vol, best_illiq)
     hist_vol = best_lag_hist(best_vol, "delta_vol")
     hist_illiq = best_lag_hist(best_illiq, "delta_illiq")
 
-    # ---- Write outputs ----
+    # Write outputs
     print("Writing:", f"{out_base}/best_lag_by_vol")
     write_parquet_and_csv(best_vol, f"{out_base}/best_lag_by_vol")
 
@@ -159,8 +153,8 @@ def main():
     print("Writing:", f"{out_base}/best_lag_hist_illiq")
     write_parquet_and_csv(hist_illiq, f"{out_base}/best_lag_hist_illiq")
 
-    # ---- Safe previews (small) ----
-    print("\nTop 10 symbols by strongest volatility propagation (best_delta_vol):")
+    # Small previews (safe)
+    print("\nTop 10 symbols by strongest propagation (best_metric):")
     best_vol.limit(10).show(truncate=False)
 
     print("\nTypical lag stats across symbols:")
