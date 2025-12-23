@@ -18,3 +18,7 @@ __pycache__/
 *.log
 spark-warehouse/
 metastore_db/
+
+# local dataset (never commit)
+binance-dataset/
+**/*.parquet

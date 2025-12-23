@@ -1,18 +1,18 @@
 from pyspark.sql import SparkSession
-from spark.config import DATA_RAW
+from config import raw_path
 
-spark = SparkSession.builder.appName("binance_ingest_check").getOrCreate()
+spark = (
+    SparkSession.builder
+    .appName("binance_ingest_check_local")
+    .master("local[*]")   # local mode
+    .getOrCreate()
+)
 
-print("Reading:", DATA_RAW)
-df = spark.read.parquet(DATA_RAW)
+path = raw_path()
+print("Reading:", path)
 
-print("Schema:")
+df = spark.read.parquet(path)
 df.printSchema()
-
-print("Sample:")
 df.show(5, truncate=False)
-
-# Avoid full scan at first (expensive). Uncomment later if needed:
-# print("Count:", df.count())
 
 spark.stop()
