@@ -1,16 +1,16 @@
 """
 features_1m.py
 
-Purpose:
-- Transform raw 1-minute candlestick Parquet files into a single analysis-ready table.
-- Add identifiers (symbol/base/quote) that are missing in the raw rows (encoded in filenames).
-- Compute scale-invariant returns (log returns) and multiple liquidity/activity proxies.
-- Produce a derived dataset suitable as a base input for RQ1/RQ2/RQ3.
+Goal:
+- Build a single "features_1m" table from raw 1-minute Binance candles (Parquet per pair).
+- Works in BOTH modes:
+  (1) Local dev: reads only a small subset of files from ./binance-dataset
+  (2) Cluster: reads full dataset from HDFS and writes to HDFS
 
-Design choice :
-- Local development should run on a SMALL subset of files (laptop memory constraints).
-- Full feature generation runs on the Spark cluster over HDFS.
-- We avoid creating thousands of small output files by NOT partitioning output by symbol.
+Why these steps (report-friendly):
+1) Attach identifiers (symbol/base/quote) -> raw rows don't include the trading pair; it's in filename.
+2) Compute returns + liquidity/activity proxies -> inputs for RQ1/RQ2/RQ3.
+3) Write derived parquet in a controlled file count -> avoid HDFS small-file problems and avoid shuffle OOMs.
 """
 
 from __future__ import annotations
@@ -20,93 +20,125 @@ import glob
 import math
 from typing import List
 
-from pyspark.sql import SparkSession, DataFrame, functions as F, Window
+from pyspark.sql import SparkSession, DataFrame, functions as F
+from pyspark.sql.window import Window
 
-# Your repo uses config.py at spark/config.py, and you're importing it as "from config import ..."
-# Keep that consistent with your ingest_check fix.
+# Keep consistent with your earlier fix: "from config import ..."
 from config import raw_path, DATA_DERIVED, IS_LOCAL
 
 
 # -----------------------------
-# Spark session construction
+# Spark session
 # -----------------------------
 def build_spark(app_name: str) -> SparkSession:
     """
-    Why we do this:
-    - Local mode accelerates development/debugging on small samples.
-    - Cluster mode uses spark-submit/yarn configs, so we do not set master there.
-    - We optionally increase driver memory locally to reduce out-of-memory errors.
+    Local:
+    - Run in local[*] mode (fast iteration).
+    - Slightly higher driver memory if your laptop can handle it.
+    Cluster:
+    - Do not set .master() (spark-submit/YARN handles it).
+    - Keep shuffle partitions moderate.
     """
-    builder = SparkSession.builder.appName(app_name)
+    builder = (
+        SparkSession.builder
+        .appName(app_name)
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.shuffle.partitions", "400")
+    )
 
     if IS_LOCAL:
         builder = (
             builder.master("local[*]")
-            .config("spark.driver.memory", "6g")          # adjust if needed
-            .config("spark.sql.shuffle.partitions", "32") # keep local shuffles manageable
+            .config("spark.driver.memory", os.environ.get("SPARK_DRIVER_MEMORY", "6g"))
+            .config("spark.sql.shuffle.partitions", "32")
         )
 
-    return builder.getOrCreate()
+    spark = builder.getOrCreate()
+
+    # Make output readable: still shows real failures
+    spark.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "ERROR"))
+
+    return spark
 
 
 # -----------------------------
-# Reading input in a safe way
+# Read raw data + attach symbol
 # -----------------------------
-def read_raw_with_symbol(spark: SparkSession, in_dir: str) -> DataFrame:
+def read_raw_with_symbol(spark: SparkSession, in_path: str) -> DataFrame:
     """
-    Read raw dataset and attach symbol.
+    Local mode:
+    - Avoid reading 1000 pairs (too big for a laptop).
+    - Read N files and union; attach 'symbol' as a constant per file (no input_file_name overhead).
 
-    Local mode strategy:
-    - Do NOT load all 1000 pairs on a laptop.
-    - Read a limited number of files and union them.
-    - Attach 'symbol' as a constant per file (fast, no input_file_name overhead).
-
-    Cluster mode strategy:
-    - Read the whole HDFS folder (scalable).
-    - Use input_file_name() to recover symbol from filename.
-      (Acceptable on cluster resources; can be optimized later.)
+    Cluster mode:
+    - Robust & scalable approach: read per file from HDFS list, attach symbol without input_file_name().
+      This avoids huge per-row file-path metadata overhead and is usually more stable.
     """
-    print("Reading from:", in_dir)
+    print("Reading from:", in_path)
 
     if IS_LOCAL:
-        LOCAL_MAX_FILES = int(os.environ.get("LOCAL_MAX_FILES", "10"))  # override via env if you want
-        files: List[str] = sorted(glob.glob(os.path.join(in_dir, "*.parquet")))[:LOCAL_MAX_FILES]
-
+        # Local folder (e.g., "binance-dataset")
+        max_files = int(os.environ.get("LOCAL_MAX_FILES", "10"))
+        files = sorted(glob.glob(os.path.join(in_path, "*.parquet")))[:max_files]
         if not files:
-            raise FileNotFoundError(f"No parquet files found in local folder: {in_dir}")
+            raise FileNotFoundError(f"No parquet files found in local folder: {in_path}")
 
-        print(f"Local mode: reading {len(files)} parquet files (LOCAL_MAX_FILES={LOCAL_MAX_FILES})")
+        print(f"Local mode: reading {len(files)} parquet files (LOCAL_MAX_FILES={max_files})")
 
         dfs: List[DataFrame] = []
         for p in files:
             sym = os.path.basename(p).replace(".parquet", "")
-            # Attach symbol per file without input_file_name() to keep memory low.
             dfs.append(spark.read.parquet(p).withColumn("symbol", F.lit(sym)))
 
         df = dfs[0]
         for d in dfs[1:]:
             df = df.unionByName(d)
 
-        # Derive base/quote identifiers from symbol
-        df = (
+        return (
             df.withColumn("base_asset", F.split(F.col("symbol"), "-").getItem(0))
               .withColumn("quote_asset", F.split(F.col("symbol"), "-").getItem(1))
         )
-        return df
 
-    # Cluster mode (HDFS): read full folder and derive symbol from filename
-    df = spark.read.parquet(in_dir).withColumn("_file", F.input_file_name())
+    # -------- Cluster mode (HDFS) --------
+    # Read file paths from HDFS and union with symbol literal.
+    # This avoids expensive input_file_name() and helps stability during wide shuffles/writes.
+    sc = spark.sparkContext
+    hadoop_conf = sc._jsc.hadoopConfiguration()
+    fs = sc._jvm.org.apache.hadoop.fs.FileSystem.get(hadoop_conf)
+    Path = sc._jvm.org.apache.hadoop.fs.Path
 
-    # Example file path ends with ".../BTC-USDT.parquet"
-    sym = F.regexp_extract(F.col("_file"), r"([^/]+)\.parquet$", 1)
+    p = Path(in_path)  # should be like hdfs:///user/.../raw
+    if not fs.exists(p):
+        raise FileNotFoundError(f"HDFS path does not exist: {in_path}")
 
-    df = (
-        df.withColumn("symbol", sym)
-          .withColumn("base_asset", F.split(F.col("symbol"), "-").getItem(0))
+    # List only parquet files
+    it = fs.listStatus(p)
+    files: List[str] = []
+    for st in it:
+        name = st.getPath().getName()
+        if name.endswith(".parquet"):
+            files.append(st.getPath().toString())
+
+    if not files:
+        raise FileNotFoundError(f"No parquet files found under HDFS path: {in_path}")
+
+    print(f"Cluster mode: found {len(files)} parquet files in HDFS raw folder")
+
+    # Union all files, adding symbol literal based on filename
+    # (This is a loop, but Spark reads lazily; it builds a logical plan.)
+    dfs: List[DataFrame] = []
+    for fp in files:
+        sym = fp.split("/")[-1].replace(".parquet", "")
+        dfs.append(spark.read.parquet(fp).withColumn("symbol", F.lit(sym)))
+
+    df = dfs[0]
+    for d in dfs[1:]:
+        df = df.unionByName(d)
+
+    return (
+        df.withColumn("base_asset", F.split(F.col("symbol"), "-").getItem(0))
           .withColumn("quote_asset", F.split(F.col("symbol"), "-").getItem(1))
-          .drop("_file")
     )
-    return df
 
 
 # -----------------------------
@@ -114,23 +146,17 @@ def read_raw_with_symbol(spark: SparkSession, in_dir: str) -> DataFrame:
 # -----------------------------
 def add_features(df: DataFrame) -> DataFrame:
     """
-    Create 1-minute features used across research questions.
-
-    Why these features:
-    - log_return: comparable across assets and standard for volatility analysis.
-    - number_of_trades: trading intensity / activity measure.
-    - quote_asset_volume: traded value proxy for liquidity.
-    - taker_ratio: order-flow imbalance proxy (aggressor buy fraction).
-    - amihud_illiq: illiquidity proxy (price impact per traded value).
+    Features (for report):
+    - log_return: standard for volatility comparisons across assets.
+    - taker_ratio: aggressor buy fraction -> order-flow imbalance.
+    - amihud_illiq: price impact per traded value -> illiquidity proxy.
+    - zero_volume_flag: identifies illiquid minutes (esp. small caps).
     - parkinson_var_1m: intrabar volatility proxy using high/low.
-    - zero_volume_flag: indicates illiquid minutes (common in small caps).
     """
-    # Window per symbol for lagging close prices
     w = Window.partitionBy("symbol").orderBy(F.col("open_time"))
 
-    # Log return: ln(C_t / C_{t-1})
+    # log return ln(C_t / C_{t-1})
     df = df.withColumn("close_lag", F.lag("close").over(w))
-
     df = df.withColumn(
         "log_return",
         F.when(
@@ -139,7 +165,7 @@ def add_features(df: DataFrame) -> DataFrame:
         ).otherwise(F.log(F.col("close") / F.col("close_lag")))
     ).drop("close_lag")
 
-    # Liquidity/activity proxies
+    # taker buy ratio (quote-based)
     df = df.withColumn(
         "taker_ratio",
         F.when(
@@ -148,6 +174,7 @@ def add_features(df: DataFrame) -> DataFrame:
         ).otherwise(F.lit(None))
     )
 
+    # Amihud illiquidity proxy
     df = df.withColumn(
         "amihud_illiq",
         F.when(
@@ -156,12 +183,13 @@ def add_features(df: DataFrame) -> DataFrame:
         ).otherwise(F.lit(None))
     )
 
+    # flag dead minutes
     df = df.withColumn(
         "zero_volume_flag",
         (F.col("quote_asset_volume") == 0) | (F.col("number_of_trades") == 0)
     )
 
-    # Parkinson variance per bar: (ln(H/L))^2 / (4 ln(2))
+    # Parkinson variance for 1-minute bar
     ln2 = math.log(2.0)
     df = df.withColumn(
         "parkinson_var_1m",
@@ -176,8 +204,8 @@ def add_features(df: DataFrame) -> DataFrame:
 
 def select_output_columns(df: DataFrame) -> DataFrame:
     """
-    Keep a compact schema to reduce storage and speed up downstream queries.
-    We keep OHLC for later regime detection, correlation tests, and debugging.
+    Keep the dataset compact:
+    - We retain OHLC and key raw volumes for later analyses/regime detection.
     """
     return df.select(
         "open_time",
@@ -195,67 +223,59 @@ def select_output_columns(df: DataFrame) -> DataFrame:
 
 
 # -----------------------------
-# Sanity checks + writing output
+# Output writing (OOM-safe)
 # -----------------------------
-def sanity_checks(df: DataFrame) -> None:
-    """
-    Lightweight validation (report-friendly).
-    We avoid expensive global actions on the full dataset.
-    """
-    required = {"open_time", "symbol", "quote_asset_volume", "number_of_trades", "log_return"}
-    missing = required - set(df.columns)
-    if missing:
-        raise RuntimeError(f"Missing required columns: {missing}")
-
-    # small action to confirm non-empty
-    if df.limit(1).count() == 0:
-        raise RuntimeError("No rows loaded. Check input path and file selection.")
-
-
 def write_output(df: DataFrame) -> str:
     """
-    Output paths:
-    - Local: data/derived/features_1m
-    - Cluster: hdfs:///user/<owner>/binance/derived/features_1m
+    Critical fix:
+    - DO NOT use repartition() on the full dataset before writing -> it forces a full shuffle.
+      Shuffles are where executor churn, FetchFailed, and OOM often happen.
 
-    File count control:
-    - Local: coalesce to a small number of files for convenience
-    - Cluster: repartition to a moderate number to balance parallelism and small-file risk
+    We use:
+    - coalesce(N): reduces file count WITHOUT shuffle (much safer)
+    - maxRecordsPerFile: avoids too many small files
     """
     out_path = "data/derived/features_1m" if IS_LOCAL else f"{DATA_DERIVED}/features_1m"
     print("Writing:", out_path)
 
     if IS_LOCAL:
         final = df.coalesce(8)
-    else:
-        # adjust later depending on cluster performance; this is a safe starting point
-        final = df.repartition(200)
+        (final.write
+              .mode("overwrite")
+              .parquet(out_path))
+        return out_path
 
-    final.write.mode("overwrite").parquet(out_path)
+    # Cluster: choose a moderate output file count; tune if needed.
+    # Coalesce avoids shuffle. 400 is a reasonable start for 35GB.
+    n_out = int(os.environ.get("COALESCE_OUT", "400"))
+    final = df.coalesce(n_out)
+
+    (final.write
+          .mode("overwrite")
+          .option("maxRecordsPerFile", os.environ.get("MAX_RECORDS_PER_FILE", "2000000"))
+          .parquet(out_path))
+
     return out_path
 
 
 def main():
     spark = build_spark("binance_features_1m")
 
-    # 1) Read raw + attach identifiers
+    # 1) Load raw
     df_raw = read_raw_with_symbol(spark, raw_path())
 
     # 2) Features
     df_feat = add_features(df_raw)
 
-    # 3) Select output schema
+    # 3) Select schema
     out_df = select_output_columns(df_feat)
 
-    # 4) Validate quickly
-    sanity_checks(out_df)
-
-    # 5) Write derived dataset
+    # 4) Write derived features_1m (OOM-safe)
     out_path = write_output(out_df)
 
-    # Optional quick peek (local only)
+    # Local preview only
     if IS_LOCAL:
-        print("Preview of derived features_1m:")
+        print("Preview:")
         spark.read.parquet(out_path).show(5, truncate=False)
 
     print("Done.")
