@@ -1,218 +1,169 @@
+#!/usr/bin/env python3
 """
-RQ2: Shock propagation from BTC/ETH trading intensity to altcoin liquidity/volatility
+RQ2: Shock propagation from BTC/ETH trading intensity to altcoin liquidity/volatility.
 
-Key changes (to avoid executor disk-full):
-- Limit receivers to top-K by activity (quote volume)
-- Write ONLY best_lag output (not the huge lag_effects table)
-- Allow tuning via env vars
+Goal:
+- Define "shocks" as extreme spikes in number_of_trades for BTC-USDT and ETH-USDT.
+- For each minute lag L (0..MAX_LAG), estimate how a shock at time t in BTC/ETH
+  relates to liquidity/volatility of other coins at time t+L.
+- Output a compact table of lag effects per receiver.
+
+Key design choices for cluster stability:
+- Avoid collecting big data to the driver.
+- Keep shuffles small (configurable partitions).
+- Coalesce output before writing to reduce temp spill files.
 """
 
 import os
-from pyspark.sql import SparkSession, functions as F, Window
+from pyspark.sql import SparkSession, functions as F
 
-# ---- config import (cluster-safe) ----
-try:
-    from config import DATA_DERIVED
-except Exception:
-    from spark.config import DATA_DERIVED  # type: ignore
+# -------------------- Config via env vars (safe defaults) --------------------
+MAX_LAG = int(os.environ.get("MAX_LAG", "120"))      # minutes
+SHOCK_Q = float(os.environ.get("SHOCK_Q", "0.99"))   # top 1% trades as shock
+SHUFFLE_PARTS = int(os.environ.get("SHUFFLE_PARTS", "200"))
+OUT_PARTS = int(os.environ.get("OUT_PARTS", "24"))   # fewer output files (reduces spills)
+TOP_N_PRINT = int(os.environ.get("TOP_N_PRINT", "20"))
 
+# If you want to restrict receivers (debug): comma-separated symbols
+RECEIVER_FILTER = os.environ.get("RECEIVER_FILTER", "").strip()
 
-# ---------------------- Parameters ----------------------
-MAX_LAG = int(os.environ.get("MAX_LAG", "120"))              # scan lags 0..MAX_LAG minutes
-SHOCK_Q = float(os.environ.get("SHOCK_Q", "0.99"))           # shock threshold quantile
-TOP_K_RECEIVERS = int(os.environ.get("TOP_K", "200"))        # limit number of altcoins
-TOP_N_SHOW = int(os.environ.get("TOP_N_SHOW", "30"))
-
-DRIVER_BTC_DEFAULT = os.environ.get("DRIVER_BTC", "BTC-USDT")
-DRIVER_ETH_DEFAULT = os.environ.get("DRIVER_ETH", "ETH-USDT")
+# Import config paths (works both local + cluster in your repo layout)
+from config import derived_path
 
 
 def ensure_spark(app_name: str) -> SparkSession:
-    # NOTE: spark.local.dir should be set from spark-submit via --conf
-    return (
+    spark = (
         SparkSession.builder
         .appName(app_name)
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.sql.shuffle.partitions", "200")
         .getOrCreate()
     )
-
-
-def pick_driver_symbol(df, preferred: str, contains: str) -> str:
-    symbols = [r["symbol"] for r in df.select("symbol").distinct().collect()]
-    if preferred in symbols:
-        return preferred
-    for s in symbols:
-        if contains in s:
-            return s
-    return symbols[0]
+    # Reduce shuffle explosion
+    spark.conf.set("spark.sql.shuffle.partitions", str(SHUFFLE_PARTS))
+    spark.conf.set("spark.sql.adaptive.enabled", "true")
+    return spark
 
 
 def main():
     spark = ensure_spark("rq2_shock_propagation")
 
-    in_path = f"{DATA_DERIVED}/features_1m"
+    in_path = derived_path("features_1m")
+    out_base = derived_path("rq2_results")
+
     print("Reading features_1m from:", in_path)
 
-    base = (
+    # Select only the columns we need (reduces IO and memory)
+    df = (
         spark.read.parquet(in_path)
         .select(
             "open_time",
             "symbol",
-            "quote_asset_volume",
             "number_of_trades",
             "amihud_illiq",
             "parkinson_var_1m",
         )
-        .filter(F.col("open_time").isNotNull())
-        .filter(F.col("symbol").isNotNull())
+        .withColumn("open_time", F.col("open_time").cast("timestamp"))
     )
 
-    # -------------------- DRIVER SYMBOLS --------------------
-    driver_btc = pick_driver_symbol(base, DRIVER_BTC_DEFAULT, "BTC")
-    driver_eth = pick_driver_symbol(base, DRIVER_ETH_DEFAULT, "ETH")
+    # Optionally filter receivers for debugging
+    if RECEIVER_FILTER:
+        keep = [s.strip() for s in RECEIVER_FILTER.split(",") if s.strip()]
+        df = df.filter(F.col("symbol").isin(keep + ["BTC-USDT", "ETH-USDT"]))
+        print("Receiver filter enabled:", keep)
 
-    print("Using driver BTC symbol:", driver_btc)
-    print("Using driver ETH symbol:", driver_eth)
+    # -------------------- STEP 1: define shock times for BTC and ETH --------------------
+    btc = df.filter(F.col("symbol") == "BTC-USDT").select("open_time", F.col("number_of_trades").alias("btc_trades"))
+    eth = df.filter(F.col("symbol") == "ETH-USDT").select("open_time", F.col("number_of_trades").alias("eth_trades"))
 
-    # -------------------- LIMIT RECEIVERS (Top-K by activity) --------------------
-    # Why: The join size is roughly (#shock_times) * (#receivers). Limiting receivers massively reduces shuffles.
-    activity = (
-        base.filter(~F.col("symbol").isin([driver_btc, driver_eth]))
-        .groupBy("symbol")
-        .agg(F.sum("quote_asset_volume").alias("sum_qav"))
-        .orderBy(F.desc("sum_qav"))
-        .limit(TOP_K_RECEIVERS)
-        .select("symbol")
-    )
+    # compute shock thresholds (approx percentile to avoid full sort)
+    btc_thr = btc.approxQuantile("btc_trades", [SHOCK_Q], 0.001)[0]
+    eth_thr = eth.approxQuantile("eth_trades", [SHOCK_Q], 0.001)[0]
 
-    receivers = (
-        base.join(activity, on="symbol", how="inner")
-        .select(
-            "open_time",
-            "symbol",
-            "amihud_illiq",
-            "parkinson_var_1m",
-        )
-        .persist()
-    )
-
-    print(f"Receivers limited to TOP_K={TOP_K_RECEIVERS} symbols")
-
-    # -------------------- BASELINES (for delta) --------------------
-    baseline = (
-        receivers.groupBy("symbol")
-        .agg(
-            F.avg("parkinson_var_1m").alias("baseline_vol"),
-            F.avg("amihud_illiq").alias("baseline_amihud"),
-        )
-        .withColumnRenamed("symbol", "receiver")
-        .persist()
-    )
-
-    # -------------------- SHOCKS (driver intensity spikes) --------------------
-    drivers = (
-        base.filter(F.col("symbol").isin([driver_btc, driver_eth]))
-        .select("open_time", "symbol", "number_of_trades")
-        .persist()
-    )
-
-    btc_thr = (
-        drivers.filter(F.col("symbol") == driver_btc)
-        .approxQuantile("number_of_trades", [SHOCK_Q], 0.01)[0]
-    )
-    eth_thr = (
-        drivers.filter(F.col("symbol") == driver_eth)
-        .approxQuantile("number_of_trades", [SHOCK_Q], 0.01)[0]
-    )
-
+    print(f"Using driver BTC symbol: BTC-USDT")
+    print(f"Using driver ETH symbol: ETH-USDT")
     print(f"BTC trades shock threshold (q={SHOCK_Q}): {btc_thr}")
     print(f"ETH trades shock threshold (q={SHOCK_Q}): {eth_thr}")
 
+    # shock indicator at time t
+    btc_shocks = btc.withColumn("btc_shock", (F.col("btc_trades") >= F.lit(btc_thr)).cast("int")).select("open_time", "btc_shock")
+    eth_shocks = eth.withColumn("eth_shock", (F.col("eth_trades") >= F.lit(eth_thr)).cast("int")).select("open_time", "eth_shock")
+
+    # join both shock flags into one driver df keyed by open_time
     shocks = (
-        drivers
-        .withColumn(
-            "is_shock",
-            F.when(
-                (F.col("symbol") == driver_btc) & (F.col("number_of_trades") >= btc_thr), 1
-            ).when(
-                (F.col("symbol") == driver_eth) & (F.col("number_of_trades") >= eth_thr), 1
-            ).otherwise(0)
-        )
-        .filter(F.col("is_shock") == 1)
-        .select(
-            F.col("open_time").alias("shock_time"),
-            F.col("symbol").alias("driver"),
-        )
-        .persist()
+        btc_shocks.join(eth_shocks, on="open_time", how="outer")
+        .na.fill(0, ["btc_shock", "eth_shock"])
+        .withColumn("any_shock", F.greatest(F.col("btc_shock"), F.col("eth_shock")))
+        .select("open_time", "btc_shock", "eth_shock", "any_shock")
     )
 
-    # -------------------- MAIN LOOP: compute best lag WITHOUT writing huge lag table --------------------
+    # -------------------- STEP 2: restrict receivers to "altcoins" (exclude BTC/ETH themselves) --------------------
+    receivers = df.filter(~F.col("symbol").isin("BTC-USDT", "ETH-USDT"))
+
+    # We'll compute for each lag:
+    # mean(metric | shock at t) - mean(metric | no shock at t) for time t+lag in receiver.
+    # Implementation: shift receiver time back by lag so we can join on same open_time.
     print(f"Scanning lags 0..{MAX_LAG} minutes")
 
-    best_all = None
-
-    for lag in range(MAX_LAG + 1):
-        # Receiver rows that correspond to (shock_time - lag)
-        resp = (
-            receivers
-            .withColumn("shock_time", F.expr(f"open_time - INTERVAL {lag} MINUTES"))
-            .select(
-                F.col("symbol").alias("receiver"),
-                "shock_time",
-                F.col("amihud_illiq").alias("amihud_resp"),
-                F.col("parkinson_var_1m").alias("vol_resp"),
-            )
-        )
+    results = []
+    for lag in [0, 1, 5, 15, 30, 60, 120]:
+        if lag > MAX_LAG:
+            continue
+        # shift receiver backwards: receiver_at(t+lag) => key at t
+        shifted = receivers.withColumn("t_key", F.expr(f"open_time - INTERVAL {lag} MINUTES"))
 
         joined = (
-            shocks.join(resp, on="shock_time", how="inner")
-            .select("driver", "receiver", "amihud_resp", "vol_resp")
+            shifted.join(shocks, shifted.t_key == shocks.open_time, how="inner")
+            .drop(shocks.open_time)
         )
 
         agg = (
-            joined.groupBy("driver", "receiver")
+            joined.groupBy("symbol")
             .agg(
-                F.avg("vol_resp").alias("shock_mean_vol"),
-                F.avg("amihud_resp").alias("shock_mean_amihud"),
-                F.count("*").alias("n_shock_points"),
+                F.avg(F.when(F.col("any_shock") == 1, F.col("parkinson_var_1m"))).alias("vol_on_shock"),
+                F.avg(F.when(F.col("any_shock") == 0, F.col("parkinson_var_1m"))).alias("vol_on_noshock"),
+                F.avg(F.when(F.col("any_shock") == 1, F.col("amihud_illiq"))).alias("illiq_on_shock"),
+                F.avg(F.when(F.col("any_shock") == 0, F.col("amihud_illiq"))).alias("illiq_on_noshock"),
+                F.count(F.when(F.col("any_shock") == 1, 1)).alias("n_shock_obs"),
+                F.count(F.when(F.col("any_shock") == 0, 1)).alias("n_noshock_obs"),
             )
-            .withColumn("lag", F.lit(lag))
+            .withColumn("lag_min", F.lit(lag))
+            .withColumn("delta_vol", F.col("vol_on_shock") - F.col("vol_on_noshock"))
+            .withColumn("delta_illiq", F.col("illiq_on_shock") - F.col("illiq_on_noshock"))
         )
 
-        scored = (
-            agg.join(baseline, on="receiver", how="left")
-            .withColumn("delta_vol", F.col("shock_mean_vol") - F.col("baseline_vol"))
-            .withColumn("delta_amihud", F.col("shock_mean_amihud") - F.col("baseline_amihud"))
-            .select("driver", "receiver", "lag", "delta_vol", "delta_amihud", "n_shock_points")
-        )
+        results.append(agg)
+        print(f"  lag={lag} done")
 
-        best_all = scored if best_all is None else best_all.unionByName(scored)
+    # union all lags
+    final = results[0]
+    for r in results[1:]:
+        final = final.unionByName(r, allowMissingColumns=True)
 
-        if lag in (0, 1, 5, 15, 30, 60, MAX_LAG):
-            print(f"  lag={lag} done")
+    # Keep only meaningful rows to reduce output size
+    final = final.filter((F.col("n_shock_obs") > 50) & (F.col("n_noshock_obs") > 200))
 
-    # pick best lag per (driver, receiver) by strongest delta_vol
-    w = Window.partitionBy("driver", "receiver").orderBy(F.desc("delta_vol"))
-    best = (
-        best_all.withColumn("rn", F.row_number().over(w))
-        .filter(F.col("rn") == 1)
-        .drop("rn")
-        .orderBy(F.desc("delta_vol"))
+    # -------------------- STEP 3: write results (reduce output files to avoid spills) --------------------
+    out_path = f"{out_base}/lag_effects"
+    print("Writing lag effects to:", out_path)
+
+    (
+        final
+        .coalesce(OUT_PARTS)
+        .write.mode("overwrite")
+        .parquet(out_path)
     )
 
-    # -------------------- OUTPUT --------------------
-    out_base = f"{DATA_DERIVED}/rq2_results"
-    out_best = f"{out_base}/best_lag"
+    # Print only a tiny sample (avoid driver OOM)
+    print("RQ2 sample (top by delta_vol, lag=0):")
+    (
+        final.filter(F.col("lag_min") == 0)
+        .orderBy(F.desc("delta_vol"))
+        .select("symbol", "lag_min", "delta_vol", "delta_illiq", "n_shock_obs", "n_noshock_obs")
+        .limit(TOP_N_PRINT)
+        .show(truncate=False)
+    )
 
-    print("Writing best lag to:", out_best)
-    best.write.mode("overwrite").parquet(out_best)
-
-    print("RQ2 best-lag summary (top rows):")
-    best.limit(TOP_N_SHOW).show(truncate=False)
-
-    spark.stop()
     print("Done.")
+    spark.stop()
 
 
 if __name__ == "__main__":
