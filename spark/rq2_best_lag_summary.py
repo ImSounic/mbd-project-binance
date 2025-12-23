@@ -5,23 +5,24 @@ RQ2 Summary: Best lag + typical lag distribution
 Input (produced by rq2_shock_propagation.py):
   - {derived_base}/rq2_results/lag_effects   (parquet)
 
-Output:
-  - {derived_base}/rq2_results/best_lag_by_vol     (parquet)
-  - {derived_base}/rq2_results/best_lag_by_illiq   (parquet)
-  - {derived_base}/rq2_results/lag_typical_stats   (parquet)
-  - {derived_base}/rq2_results/best_lag_hist_vol   (parquet)
-  - {derived_base}/rq2_results/best_lag_hist_illiq (parquet)
+Expected columns (your current pipeline):
+  symbol,
+  lag_min,
+  delta_vol,
+  delta_illiq,
+  n_shock_obs,
+  (optionally) vol_on_shock, vol_on_noshock, illiq_on_shock, illiq_on_noshock, n_noshock_obs
 
-Also writes CSV "single file" versions (coalesced to 1 partition) for easy download:
-  - .../csv_best_lag_by_vol
-  - .../csv_best_lag_by_illiq
-  - .../csv_lag_typical_stats
-  - .../csv_best_lag_hist_vol
-  - .../csv_best_lag_hist_illiq
+Output:
+  - {derived_base}/rq2_results/best_lag_by_vol     (parquet + csv)
+  - {derived_base}/rq2_results/best_lag_by_illiq   (parquet + csv)
+  - {derived_base}/rq2_results/lag_typical_stats   (parquet + csv)
+  - {derived_base}/rq2_results/best_lag_hist_vol   (parquet + csv)
+  - {derived_base}/rq2_results/best_lag_hist_illiq (parquet + csv)
 
 Why this file exists:
-  - We avoid big collect/show on the driver (can OOM).
-  - We standardize the outputs so your report can cite tables directly.
+  - Avoid big .show()/collect on driver (can OOM).
+  - Produce stable, report-ready summary tables.
 """
 
 import os
@@ -31,74 +32,62 @@ from pyspark.sql import SparkSession, functions as F, Window
 # -------------------- Config helpers --------------------
 def _get_derived_base() -> str:
     """
-    Uses your existing config.py if available.
+    Uses config.py if available.
     - Cluster: hdfs:///user/<id>/binance/derived
     - Local:   data/derived
     """
     try:
-        # Prefer local import style (spark-submit from repo root)
         import config  # type: ignore
 
-        # If your config has DATA_DERIVED and IS_LOCAL (as in your earlier snippet)
         if getattr(config, "IS_LOCAL", False):
             return "data/derived"
         return getattr(config, "DATA_DERIVED", "data/derived")
     except Exception:
-        # Fallback: assume local layout
         return "data/derived"
 
 
 def ensure_spark(app_name: str) -> SparkSession:
-    spark = (
-        SparkSession.builder
-        .appName(app_name)
-        .getOrCreate()
-    )
-    # Keep Spark logs quieter in console (still visible in YARN logs if needed)
+    spark = SparkSession.builder.appName(app_name).getOrCreate()
     spark.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "WARN"))
     return spark
 
 
 # -------------------- Core logic --------------------
-def best_by_metric(df, metric_col: str, out_name: str):
+def best_by_metric(df, metric_col: str):
     """
     For each symbol, pick the lag that maximizes `metric_col`.
-    Tie-breaker: prefer smaller lag (faster propagation).
+    Tie-breaker: smaller lag (faster propagation).
     """
     w = Window.partitionBy("symbol").orderBy(F.col(metric_col).desc(), F.col("lag").asc())
 
     best = (
-        df
-        .withColumn("rn", F.row_number().over(w))
-        .filter(F.col("rn") == 1)
-        .drop("rn")
-        .select(
-            "symbol",
-            "lag",
-            F.col(metric_col).alias(f"best_{metric_col}"),
-            # Keep the paired metric too for context in the report
-            "delta_vol",
-            "delta_illiq",
-            "n_shock_obs",
-        )
-        .orderBy(F.col(f"best_{metric_col}").desc())
+        df.withColumn("rn", F.row_number().over(w))
+          .filter(F.col("rn") == 1)
+          .drop("rn")
     )
-    return best
+
+    # Keep useful context columns if they exist
+    cols = ["symbol", "lag", metric_col, "delta_vol", "delta_illiq", "n_shock_obs"]
+    optional = ["vol_on_shock", "vol_on_noshock", "illiq_on_shock", "illiq_on_noshock", "n_noshock_obs"]
+    cols += [c for c in optional if c in best.columns]
+
+    # Rename the chosen metric column for clarity
+    best = best.select(*cols).withColumnRenamed(metric_col, f"best_{metric_col}")
+
+    return best.orderBy(F.col(f"best_{metric_col}").desc())
 
 
 def typical_lag_stats(best_vol, best_illiq):
     """
-    Provide typical lag summary stats across symbols:
-      - count symbols
+    Typical lag summary stats across symbols:
+      - mean lag
       - median lag
       - p25/p75 lag
-      - mean lag
+      - number of symbols
     """
     def stats_for(best_df, label: str):
-        # percentile_approx is scalable + safe
         return (
-            best_df
-            .agg(
+            best_df.agg(
                 F.lit(label).alias("metric"),
                 F.count("*").alias("n_symbols"),
                 F.avg("lag").alias("mean_lag"),
@@ -112,27 +101,18 @@ def typical_lag_stats(best_vol, best_illiq):
 
 
 def best_lag_hist(best_df, label: str):
-    """
-    Count how many symbols have each lag as their best lag.
-    """
+    """How often each lag is 'best' across symbols."""
     return (
-        best_df
-        .groupBy("lag")
-        .agg(F.count("*").alias("n_symbols"))
-        .withColumn("metric", F.lit(label))
-        .orderBy("lag")
-        .select("metric", "lag", "n_symbols")
+        best_df.groupBy("lag")
+               .agg(F.count("*").alias("n_symbols"))
+               .withColumn("metric", F.lit(label))
+               .select("metric", "lag", "n_symbols")
+               .orderBy("lag")
     )
 
 
 def write_parquet_and_csv(df, out_base: str):
-    """
-    Writes:
-      - parquet to out_base
-      - coalesced CSV to out_base + "_csv"
-    """
     df.write.mode("overwrite").parquet(out_base)
-    # CSV for easy retrieval; single file for convenience
     df.coalesce(1).write.mode("overwrite").option("header", True).csv(out_base + "_csv")
 
 
@@ -146,30 +126,35 @@ def main():
     print("Reading RQ2 lag effects from:", in_path)
     df = spark.read.parquet(in_path)
 
-    # Minimal schema expectation:
-    # lag (int), symbol (str), delta_vol (double), delta_illiq (double), n_shock_obs (long/int)
-    needed = {"lag", "symbol", "delta_vol", "delta_illiq", "n_shock_obs"}
+    # ---- Normalize lag column name ----
+    # Your file has lag_min. Some versions might have lag.
+    if "lag" not in df.columns:
+        if "lag_min" in df.columns:
+            df = df.withColumnRenamed("lag_min", "lag")
+        else:
+            raise ValueError(f"Missing lag column: expected 'lag' or 'lag_min'. Found: {df.columns}")
+
+    # ---- Validate required columns ----
+    needed = {"symbol", "lag", "delta_vol", "delta_illiq", "n_shock_obs"}
     missing = [c for c in needed if c not in df.columns]
     if missing:
         raise ValueError(f"Missing columns in lag_effects: {missing}. Found: {df.columns}")
 
-    # Optional hygiene: drop extremely tiny samples (unstable estimates)
-    # You can tune this threshold; keep it mild so we don’t throw away too much.
+    # ---- Filter unstable estimates ----
     MIN_SHOCK_OBS = int(os.environ.get("MIN_SHOCK_OBS", "200"))
     df = df.filter(F.col("n_shock_obs") >= F.lit(MIN_SHOCK_OBS))
-
     print(f"Keeping rows with n_shock_obs >= {MIN_SHOCK_OBS}")
 
-    # Best lag per symbol for each metric
-    best_vol = best_by_metric(df, "delta_vol", "best_lag_by_vol")
-    best_illiq = best_by_metric(df, "delta_illiq", "best_lag_by_illiq")
+    # ---- Best lag per symbol ----
+    best_vol = best_by_metric(df, "delta_vol")
+    best_illiq = best_by_metric(df, "delta_illiq")
 
-    # Typical lag statistics + histograms
+    # ---- Typical lag stats + histograms ----
     stats = typical_lag_stats(best_vol, best_illiq)
     hist_vol = best_lag_hist(best_vol, "delta_vol")
     hist_illiq = best_lag_hist(best_illiq, "delta_illiq")
 
-    # Write outputs
+    # ---- Write outputs ----
     print("Writing:", f"{out_base}/best_lag_by_vol")
     write_parquet_and_csv(best_vol, f"{out_base}/best_lag_by_vol")
 
@@ -185,18 +170,12 @@ def main():
     print("Writing:", f"{out_base}/best_lag_hist_illiq")
     write_parquet_and_csv(hist_illiq, f"{out_base}/best_lag_hist_illiq")
 
-    # Safe previews (tiny, no huge show)
+    # ---- Small safe previews ----
     print("\nTop 10 symbols by strongest volatility propagation (best delta_vol):")
     best_vol.limit(10).show(truncate=False)
 
-    print("\nTop 10 symbols by strongest liquidity change (best delta_illiq):")
-    best_illiq.limit(10).show(truncate=False)
-
     print("\nTypical lag stats across symbols:")
     stats.show(truncate=False)
-
-    print("\nBest-lag histogram (volatility):")
-    hist_vol.show(200, truncate=False)
 
     spark.stop()
     print("Done.")
