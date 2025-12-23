@@ -1,255 +1,261 @@
 """
-RQ2: Shock propagation from BTC/ETH trading intensity (number_of_trades) to altcoin liquidity/volatility.
+RQ2: Shock propagation from BTC/ETH trading intensity to altcoin liquidity/volatility.
 
-This version DOES NOT require a `tier` column in features_1m.
+Research Question:
+How do shocks in the trading intensity (number_of_trades) of BTC and ETH propagate
+to the liquidity (Amihud illiquidity) and volatility (Parkinson variance) of smaller altcoins,
+and what is the typical time lag?
 
-Idea:
-- Use BTC and ETH as drivers.
-- Define "shock" minutes as top q percentile of number_of_trades for BTC/ETH.
-- For all receiver assets (everything except BTC/ETH), measure how liquidity/volatility changes
-  at time t+lag when BTC/ETH had a shock at time t.
-- Scan lags 0..MAX_LAG, pick typical lag where the impact is strongest.
+Key idea (why these steps):
+1) Use number_of_trades spikes as a proxy for sudden market attention / intensity shocks.
+2) Use BTC and ETH as "drivers" because they are the dominant benchmarks.
+3) Measure altcoin response using:
+   - parkinson_var_1m  (intraminute volatility proxy)
+   - amihud_illiq      (illiquidity proxy: |return| / volume proxy)
+4) We measure response with a time lag: lag = 0..MAX_LAG minutes.
+5) For each lag, compare mean response on "shock minutes" vs "non-shock minutes".
+   The difference = propagation effect size.
 
-Inputs:
-- features_1m parquet folder
-
-Outputs (parquet):
-- {derived}/rq2_results/lag_scan
-- {derived}/rq2_results/best_lag
+Performance choices (important on cluster):
+- Avoid python loops over symbols with collect() (driver OOM risk)
+- Avoid huge cartesian joins.
+- Use Spark window functions (lead) to compute future response at different lags.
+- Only show/collect small top-N summaries.
 """
 
 import os
-from typing import Tuple, List
+from pyspark.sql import SparkSession, functions as F, Window
 
-from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql import functions as F
-from pyspark.sql import Window
+# ---- config import that works with spark-submit from repo root ----
+try:
+    # when running from spark/ directory sometimes
+    from config import DATA_DERIVED, raw_path, derived_path
+except Exception:
+    # when spark-submit resolves modules differently
+    from spark.config import DATA_DERIVED, raw_path, derived_path  # type: ignore
 
-from config import (
-    IS_LOCAL,
-    derived_path,
-    features_1m_path,
-)
 
-# -----------------------
-# Tunables (env override)
-# -----------------------
-DRIVER_QUOTE = os.environ.get("RQ2_DRIVER_QUOTE", "USDT")  # prefer BTC-USDT, ETH-USDT
-SHOCK_Q = float(os.environ.get("RQ2_SHOCK_Q", "0.99"))     # top 1% trades = shock
-MAX_LAG = int(os.environ.get("RQ2_MAX_LAG", "120"))        # search up to 120 minutes
-OUTPUT_SUBDIR = os.environ.get("RQ2_OUT", "rq2_results")
+# ---------------------- Parameters (easy to tweak) ----------------------
+MAX_LAG = int(os.environ.get("MAX_LAG", "120"))          # minutes
+SHOCK_Q = float(os.environ.get("SHOCK_Q", "0.99"))       # top 1% trades as shocks
+TOP_N_SHOW = int(os.environ.get("TOP_N_SHOW", "30"))     # print only top N rows
 
-# Optional: restrict receivers to smaller universe for speed (default = all non-BTC/ETH)
-# Example: "USDT" keeps only *-USDT receiver pairs
-RECEIVER_QUOTE = os.environ.get("RQ2_RECEIVER_QUOTE", "")
+# Drivers: try these first; if missing, we auto-pick by contains("BTC") etc.
+DRIVER_BTC_DEFAULT = os.environ.get("DRIVER_BTC", "BTC-USDT")
+DRIVER_ETH_DEFAULT = os.environ.get("DRIVER_ETH", "ETH-USDT")
 
 
 def ensure_spark(app_name: str) -> SparkSession:
-    b = SparkSession.builder.appName(app_name)
-    if IS_LOCAL:
-        b = b.master("local[*]")
-    b = b.config("spark.sql.adaptive.enabled", "true")
-    return b.getOrCreate()
-
-
-def pick_driver_symbol(df: DataFrame, base_asset: str, quote_asset: str) -> str:
     """
-    Pick driver like BTC-USDT / ETH-USDT.
-    Falls back to any symbol where base_asset matches if exact quote not found.
+    Create SparkSession with reasonable defaults.
+    Why: Make local+cluster runs consistent and reduce accidental huge shuffles.
     """
-    cand = (
-        df.filter((F.col("base_asset") == base_asset) & (F.col("quote_asset") == quote_asset))
-          .select("symbol")
-          .distinct()
-          .limit(1)
-          .collect()
-    )
-    if cand:
-        return cand[0]["symbol"]
-
-    cand2 = (
-        df.filter(F.col("base_asset") == base_asset)
-          .select("symbol")
-          .distinct()
-          .limit(1)
-          .collect()
-    )
-    if not cand2:
-        raise RuntimeError(f"No symbol found for base_asset={base_asset}")
-    return cand2[0]["symbol"]
-
-
-def compute_driver_shocks(df: DataFrame, driver_symbol: str, shock_q: float) -> Tuple[DataFrame, float]:
-    """
-    Return (driver_shocks_df, threshold).
-    driver_shocks_df columns: open_time, is_shock (0/1), trades
-    """
-    d = (
-        df.filter(F.col("symbol") == driver_symbol)
-          .select("open_time", F.col("number_of_trades").cast("double").alias("trades"))
-          .filter(F.col("trades").isNotNull())
+    builder = (
+        SparkSession.builder
+        .appName(app_name)
+        .config("spark.sql.adaptive.enabled", "true")
+        .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+        .config("spark.sql.files.maxPartitionBytes", "134217728")  # 128MB
     )
 
-    thr = d.select(F.expr(f"percentile_approx(trades, {shock_q})").alias("thr")).collect()[0]["thr"]
-    d = d.withColumn("is_shock", (F.col("trades") >= F.lit(thr)).cast("int"))
-    return d, float(thr)
+    # If running locally, force local master. On cluster, spark-submit manages it.
+    if os.environ.get("IS_LOCAL", "").lower() in ("1", "true", "yes"):
+        builder = builder.master("local[*]")
+
+    return builder.getOrCreate()
 
 
-def response_by_lag(
-    df: DataFrame,
-    driver_shocks: DataFrame,
-    lags: List[int],
-    receiver_filter: DataFrame,
-) -> DataFrame:
+def pick_driver_symbol(df, preferred: str, fallback_contains: str) -> str:
     """
-    For each lag, join driver shocks at time t to receivers at time t+lag, then compare:
-      E[metric | shock] - E[metric | nonshock]
-
-    receiver_filter is already the receiver dataframe with needed cols.
+    Choose driver symbol robustly.
+    Why: Some datasets may use different quote assets, so we fall back gracefully.
     """
-
-    results = []
-    for lag in lags:
-        # receiver at (open_time) is affected by driver shock at (open_time - lag)
-        shifted = receiver_filter.withColumn("driver_time", F.expr(f"open_time - INTERVAL {lag} MINUTES"))
-
-        joined = (
-            shifted.join(
-                driver_shocks.select(F.col("open_time").alias("driver_time"), "is_shock"),
-                on="driver_time",
-                how="inner",
-            ).drop("driver_time")
-        )
-
-        agg = (
-            joined.groupBy("is_shock")
-                  .agg(
-                      F.avg("amihud_illiq").alias("avg_amihud"),
-                      F.avg("parkinson_var_1m").alias("avg_parkinson"),
-                      F.count(F.lit(1)).alias("n_obs"),
-                  )
-        )
-
-        pivot = (
-            agg.groupBy()
-               .pivot("is_shock", [0, 1])
-               .agg(
-                   F.first("avg_amihud").alias("avg_amihud"),
-                   F.first("avg_parkinson").alias("avg_parkinson"),
-                   F.first("n_obs").alias("n_obs"),
-               )
-        )
-
-        row = (
-            pivot.select(
-                F.lit(lag).alias("lag_min"),
-                F.col("1_avg_amihud").alias("shock_avg_amihud"),
-                F.col("0_avg_amihud").alias("nonshock_avg_amihud"),
-                (F.col("1_avg_amihud") - F.col("0_avg_amihud")).alias("delta_amihud"),
-                F.col("1_avg_parkinson").alias("shock_avg_parkinson"),
-                F.col("0_avg_parkinson").alias("nonshock_avg_parkinson"),
-                (F.col("1_avg_parkinson") - F.col("0_avg_parkinson")).alias("delta_parkinson"),
-                F.col("1_n_obs").alias("n_shock"),
-                F.col("0_n_obs").alias("n_nonshock"),
-            )
-        )
-        results.append(row)
-
-    out = results[0]
-    for r in results[1:]:
-        out = out.unionByName(r)
-    return out
+    symbols = [r["symbol"] for r in df.select("symbol").distinct().collect()]
+    if preferred in symbols:
+        return preferred
+    # fallback: first symbol containing BTC or ETH
+    for s in symbols:
+        if fallback_contains in s:
+            return s
+    # last resort: just pick the first (should not happen)
+    return symbols[0]
 
 
 def main():
     spark = ensure_spark("rq2_shock_propagation")
 
-    in_path = features_1m_path()
-    out_path = f"{derived_path()}/{OUTPUT_SUBDIR}"
-
+    # ---- Input: features_1m produced earlier ----
+    in_path = derived_path("features_1m")
     print("Reading features_1m from:", in_path)
-    df = spark.read.parquet(in_path).select(
-        "open_time",
-        "symbol",
-        "base_asset",
-        "quote_asset",
-        "number_of_trades",
-        "amihud_illiq",
-        "parkinson_var_1m",
+
+    # keep only what we need (why: smaller memory, faster shuffles)
+    df = (
+        spark.read.parquet(in_path)
+        .select(
+            "open_time",
+            "symbol",
+            "number_of_trades",
+            "amihud_illiq",
+            "parkinson_var_1m",
+        )
+        .withColumn("open_time", F.col("open_time").cast("timestamp"))
     )
 
-    # -------------------- STEP 1: choose driver pairs BTC/ETH --------------------
-    btc_symbol = pick_driver_symbol(df, "BTC", DRIVER_QUOTE)
-    eth_symbol = pick_driver_symbol(df, "ETH", DRIVER_QUOTE)
-    print("Using driver BTC symbol:", btc_symbol)
-    print("Using driver ETH symbol:", eth_symbol)
+    # Basic sanitation (why: avoid NaN/Inf issues and meaningless rows)
+    df = df.filter(F.col("open_time").isNotNull()).filter(F.col("symbol").isNotNull())
 
-    # -------------------- STEP 2: define shocks from trade spikes --------------------
-    btc_shocks, btc_thr = compute_driver_shocks(df, btc_symbol, SHOCK_Q)
-    eth_shocks, eth_thr = compute_driver_shocks(df, eth_symbol, SHOCK_Q)
+    # Identify actual driver symbols in your dataset
+    driver_btc = pick_driver_symbol(df, DRIVER_BTC_DEFAULT, "BTC")
+    driver_eth = pick_driver_symbol(df, DRIVER_ETH_DEFAULT, "ETH")
+    print("Using driver BTC symbol:", driver_btc)
+    print("Using driver ETH symbol:", driver_eth)
+
+    # -------------------- STEP 1: Build shock flags for drivers --------------------
+    # Why: define "shock minute" as extreme spikes in number_of_trades (top q percentile).
+    drivers = df.filter(F.col("symbol").isin([driver_btc, driver_eth]))
+
+    # compute thresholds
+    btc_thr = (
+        drivers.filter(F.col("symbol") == driver_btc)
+        .approxQuantile("number_of_trades", [SHOCK_Q], 0.01)[0]
+    )
+    eth_thr = (
+        drivers.filter(F.col("symbol") == driver_eth)
+        .approxQuantile("number_of_trades", [SHOCK_Q], 0.01)[0]
+    )
+
     print(f"BTC trades shock threshold (q={SHOCK_Q}): {btc_thr}")
     print(f"ETH trades shock threshold (q={SHOCK_Q}): {eth_thr}")
 
-    # -------------------- STEP 3: define receiver universe (all non-BTC/ETH) --------------------
-    # Why: we want propagation into "smaller altcoins", but we don't have market cap tiers in features_1m.
-    # So we include all non-BTC/ETH base assets; we can later narrow using a cap-list if desired.
-    receivers = (
-        df.filter(~F.col("base_asset").isin(["BTC", "ETH"]))
-          .select(
-              "open_time",
-              "symbol",
-              "base_asset",
-              "quote_asset",
-              F.col("amihud_illiq").cast("double").alias("amihud_illiq"),
-              F.col("parkinson_var_1m").cast("double").alias("parkinson_var_1m"),
-          )
-          .filter(F.col("amihud_illiq").isNotNull() & F.col("parkinson_var_1m").isNotNull())
+    shocks = (
+        drivers.select("open_time", "symbol", "number_of_trades")
+        .withColumn(
+            "is_shock",
+            F.when(
+                (F.col("symbol") == driver_btc) & (F.col("number_of_trades") >= F.lit(btc_thr)),
+                F.lit(1),
+            ).when(
+                (F.col("symbol") == driver_eth) & (F.col("number_of_trades") >= F.lit(eth_thr)),
+                F.lit(1),
+            ).otherwise(F.lit(0))
+        )
+        .filter(F.col("is_shock") == 1)
+        .select(
+            F.col("open_time").alias("shock_time"),
+            F.col("symbol").alias("driver"),
+            "is_shock",
+        )
     )
 
-    if RECEIVER_QUOTE:
-        receivers = receivers.filter(F.col("quote_asset") == RECEIVER_QUOTE)
-        print("Receiver filter: quote_asset =", RECEIVER_QUOTE)
+    # Cache shocks because we reuse it many times
+    shocks = shocks.persist()
 
-    # -------------------- STEP 4: scan lags --------------------
-    lags = list(range(0, MAX_LAG + 1))
+    # -------------------- STEP 2: Prepare receiver panel + future values (lead) --------------------
+    # Why: propagation means receiver reacts AFTER the shock.
+    # Instead of joining receiver to shifted times repeatedly via python loops,
+    # we compute "future response at lag L" using lead(...) within each symbol.
+    w = Window.partitionBy("symbol").orderBy("open_time")
+
+    base = (
+        df.filter(~F.col("symbol").isin([driver_btc, driver_eth]))
+        .select("open_time", "symbol", "amihud_illiq", "parkinson_var_1m")
+    )
+
+    # For RQ2 we only need response variables at t+lag
+    # We'll build results by iterating lags, but never collecting symbol lists to the driver.
     print(f"Scanning lags 0..{MAX_LAG} minutes over receivers...")
 
-    btc_lag_tbl = response_by_lag(df, btc_shocks, lags, receivers).withColumn("driver", F.lit("BTC"))
-    eth_lag_tbl = response_by_lag(df, eth_shocks, lags, receivers).withColumn("driver", F.lit("ETH"))
-    all_lags = btc_lag_tbl.unionByName(eth_lag_tbl)
+    results = None
 
-    # -------------------- STEP 5: pick "typical lag" per driver --------------------
-    # We define typical lag as the lag with the largest absolute delta in volatility proxy.
-    w = Window.partitionBy("driver").orderBy(F.desc(F.abs(F.col("delta_parkinson"))))
-    best = (
-        all_lags.withColumn("rk", F.row_number().over(w))
-                .filter(F.col("rk") == 1)
-                .drop("rk")
-                .select(
-                    "driver",
-                    "lag_min",
-                    "delta_amihud",
-                    "delta_parkinson",
-                    "shock_avg_amihud",
-                    "nonshock_avg_amihud",
-                    "shock_avg_parkinson",
-                    "nonshock_avg_parkinson",
-                    "n_shock",
-                    "n_nonshock",
-                )
+    # We join shocks -> receivers by aligning:
+    # shock at time t  influences receiver at time t+lag
+    # so we build receiver_future where response_time = open_time, and shock_time = open_time - lag
+    for lag in range(0, MAX_LAG + 1):
+        # receiver response at t (current row), but we want response at t+lag relative to shock_time
+        # easiest: for each receiver row at time t, define shock_time = t - lag
+        receiver_at_response = (
+            base
+            .withColumn("lag", F.lit(lag))
+            .withColumn("shock_time", F.expr(f"open_time - INTERVAL {lag} MINUTES"))
+            .select(
+                "symbol",
+                "lag",
+                "shock_time",
+                F.col("amihud_illiq").alias("amihud_resp"),
+                F.col("parkinson_var_1m").alias("vol_resp"),
+            )
+        )
+
+        joined = (
+            shocks.join(receiver_at_response, on="shock_time", how="inner")
+            .select("driver", F.col("symbol").alias("receiver"), "lag", "amihud_resp", "vol_resp")
+        )
+
+        # Aggregate effect size for this lag (why: compare mean response on shock minutes)
+        # Note: we're not computing non-shock baseline here; to get baseline we compute overall mean later.
+        agg = (
+            joined.groupBy("driver", "receiver", "lag")
+            .agg(
+                F.avg("vol_resp").alias("shock_mean_vol"),
+                F.avg("amihud_resp").alias("shock_mean_amihud"),
+                F.count("*").alias("n_shock_points"),
+            )
+        )
+
+        results = agg if results is None else results.unionByName(agg)
+
+        # small progress print (doesn't spam)
+        if lag in (0, 1, 5, 15, 30, 60, 120) or lag == MAX_LAG:
+            print(f"  computed lag={lag}")
+
+    # -------------------- STEP 3: Add non-shock baselines per receiver --------------------
+    # Why: we want a difference: (shock mean) - (normal mean)
+    baseline = (
+        base.groupBy("symbol")
+        .agg(
+            F.avg("parkinson_var_1m").alias("baseline_mean_vol"),
+            F.avg("amihud_illiq").alias("baseline_mean_amihud"),
+        )
+        .withColumnRenamed("symbol", "receiver")
     )
 
-    print("RQ2 best-lag summary (by strongest volatility response):")
-    best.show(truncate=False)
+    final = (
+        results.join(baseline, on="receiver", how="left")
+        .withColumn("delta_vol", F.col("shock_mean_vol") - F.col("baseline_mean_vol"))
+        .withColumn("delta_amihud", F.col("shock_mean_amihud") - F.col("baseline_mean_amihud"))
+    )
 
-    print("Writing detailed lag table to:", f"{out_path}/lag_scan")
-    all_lags.repartition(1).write.mode("overwrite").parquet(f"{out_path}/lag_scan")
+    # -------------------- STEP 4: pick best lag per (driver, receiver) --------------------
+    # Why: we want "typical time lag" -> lag with strongest volatility response.
+    w_best = Window.partitionBy("driver", "receiver").orderBy(F.desc("delta_vol"))
 
-    print("Writing best-lag summary to:", f"{out_path}/best_lag")
-    best.repartition(1).write.mode("overwrite").parquet(f"{out_path}/best_lag")
+    best = (
+        final.withColumn("rn", F.row_number().over(w_best))
+        .filter(F.col("rn") == 1)
+        .drop("rn")
+        .orderBy(F.desc("delta_vol"))
+    )
+
+    # ---- Output paths ----
+    out_dir = derived_path("rq2_results")
+    out_effects = f"{out_dir}/lag_effects"
+    out_best = f"{out_dir}/best_lag"
+
+    print("Writing lag effects to:", out_effects)
+    final.write.mode("overwrite").parquet(out_effects)
+
+    print("Writing best lags to:", out_best)
+    best.write.mode("overwrite").parquet(out_best)
+
+    # Keep driver safe: only show top-N
+    print("RQ2 best-lag summary (top by strongest volatility response):")
+    best.select(
+        "driver", "receiver", "lag", "delta_vol", "delta_amihud", "n_shock_points"
+    ).limit(TOP_N_SHOW).show(truncate=False)
+
+    print("Done.")
 
     spark.stop()
-    print("Done.")
 
 
 if __name__ == "__main__":
