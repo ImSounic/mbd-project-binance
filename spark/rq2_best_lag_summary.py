@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 RQ2 - Best lag summary (post-processing)
 
@@ -20,9 +19,7 @@ from typing import List
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-# --- Make imports robust in BOTH cases:
-# 1) running as "python spark/..." locally
-# 2) running as "spark-submit spark/..." on cluster
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -44,7 +41,7 @@ except Exception:
         return f"hdfs:///user/{user}/binance/derived"
 
 
-# -------------------- Config --------------------
+#Config
 IN_SUBDIR = "rq2_results/lag_effects"
 OUT_BASE_SUBDIR = "rq2_results"
 
@@ -57,11 +54,11 @@ EXCLUDE_LEVERAGED = os.environ.get("EXCLUDE_LEVERAGED", "1") == "1"
 LEVERAGED_PATTERNS = ["UP", "DOWN", "BULL", "BEAR"]
 
 
-# -------------------- Helpers --------------------
+#Helpers
 def is_leveraged_symbol_col(col: F.Column) -> F.Column:
     """
     Returns a Spark boolean expression for leveraged token symbols.
-    We match token suffixes like:
+    Match token suffixes like:
       BTCUP-USDT, ETHDOWN-USDT, ADA-BULL/BEAR etc.
     """
     # match "-(UP|DOWN|BULL|BEAR)" anywhere after a hyphen
@@ -132,7 +129,7 @@ def lag_typical_stats(best_df, metric_label: str):
     )
 
 
-# -------------------- Main --------------------
+#Main
 def main():
     spark = ensure_spark("rq2_best_lag_summary")
 
@@ -202,7 +199,7 @@ def main():
                  .orderBy(F.col("best_metric").desc(), F.col("lag").asc())
     )
 
-    # -------------------- Write outputs --------------------
+    #outputs
     out1 = f"{out_base}/best_lag_by_vol"
     out2 = f"{out_base}/best_lag_by_illiq"
     out3 = f"{out_base}/lag_typical_stats"
@@ -224,7 +221,7 @@ def main():
     print("Writing:", out5)
     hist_illiq.coalesce(1).write.mode("overwrite").parquet(out5)
 
-    # -------------------- Print report-friendly previews --------------------
+    #print top 10s and stats
     print("\nTop 10 symbols by strongest propagation (volatility metric):")
     best_join.select(
         "symbol", "lag",

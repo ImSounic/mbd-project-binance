@@ -9,7 +9,7 @@ to volatility and liquidity of smaller cryptocurrencies at different time lags.
 import os
 from pyspark.sql import SparkSession, functions as F
 
-# -------------------- Tunables (safe defaults for cluster) --------------------
+#Tunables (safe defaults for cluster)
 MAX_LAG = int(os.environ.get("MAX_LAG", "120"))
 SHOCK_Q = float(os.environ.get("SHOCK_Q", "0.99"))
 SHUFFLE_PARTS = int(os.environ.get("SHUFFLE_PARTS", "120"))
@@ -36,7 +36,7 @@ def ensure_spark(app_name: str) -> SparkSession:
 def main():
     spark = ensure_spark("rq2_shock_propagation")
 
-    # ----------- FIXED PATH HANDLING (IMPORTANT) -----------
+    #FIXED PATH HANDLING
     base_derived = derived_path()
     in_path = f"{base_derived}/features_1m"
     out_base = f"{base_derived}/rq2_results"
@@ -60,7 +60,7 @@ def main():
         df = df.filter(F.col("symbol").isin(keep + ["BTC-USDT", "ETH-USDT"]))
         print("Receiver filter enabled:", keep)
 
-    # -------------------- BTC & ETH shock definition --------------------
+    #BTC & ETH shock definition
     btc = df.filter(F.col("symbol") == "BTC-USDT") \
             .select("open_time", F.col("number_of_trades").alias("btc_trades"))
     eth = df.filter(F.col("symbol") == "ETH-USDT") \

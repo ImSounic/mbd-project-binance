@@ -1,6 +1,6 @@
 import os
 
-# Edit these if the "data owner" differs.
+
 DATA_OWNER = os.environ.get("DATA_OWNER", "s3702111")
 
 DATA_RAW = f"hdfs:///user/{DATA_OWNER}/binance/raw"
@@ -12,8 +12,6 @@ DATA_RAW_LOCAL = os.environ.get("DATA_RAW_LOCAL", "binance-dataset")
 DATA_DERIVED_LOCAL = os.environ.get("DATA_DERIVED_LOCAL", "data/derived")
 DATA_RESULTS_LOCAL = os.environ.get("DATA_RESULTS_LOCAL", "data/results")
 
-# Toggle this when running locally vs cluster
-# You can override with: IS_LOCAL=0 spark-submit ...
 IS_LOCAL = os.environ.get("IS_LOCAL", "0") == "1"
 
 

@@ -155,19 +155,19 @@ def maybe_upload_to_hdfs(local_dir: str, hdfs_dir: str):
 def main():
     spark = ensure_spark("rq1_visualisations")
 
-    # ---------- 1) Read summary results from rq1_compare ----------
+    #Read summary results from rq1_compare
     compare_path = results_rq1_compare_path()
     print(f"Reading RQ1 compare summary from: {compare_path}")
     summary = spark.read.parquet(compare_path)
 
-    # Convert to pandas (small)
+    #Convert to pandas (small)
     summary_pd = summary.toPandas()
 
     # Output directory for PNGs
     fig_dir = Path(results_fig_dir_local())
     fig_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---------- 2) Bar plots from summary (Stress vs Non-Stress) ----------
+    #Bar plots from summary (Stress vs Non-Stress)
     save_barplot(
         summary_pd,
         x="tier",
@@ -212,7 +212,7 @@ def main():
         logy=True
     )
 
-    # ---------- 3) Optional distribution plots using sampling ----------
+    #Optional distribution plots using sampling
     # Why: show skew and tail behavior; tables hide distribution differences.
     feat_path = derived_features_path()
     feat_path = select_input_files_for_local(feat_path)
@@ -224,7 +224,6 @@ def main():
     )
 
     # Sample per group (tier, is_stress) approximately, to keep collect safe
-    # (We don't need exact sampling; we need a representative distribution picture.)
     sampled = (
         feat
         .withColumn("abs_return", F.abs("log_return"))
@@ -275,7 +274,7 @@ def main():
         logy=True
     )
 
-    # ---------- 4) Upload PNGs to HDFS (cluster) ----------
+    #Upload PNGs to HDFS (cluster)
     maybe_upload_to_hdfs(str(fig_dir), results_fig_dir_hdfs())
 
     spark.stop()

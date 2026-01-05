@@ -66,7 +66,7 @@ def ensure_spark(app_name: str) -> SparkSession:
     spark.sparkContext.setLogLevel(os.environ.get("SPARK_LOG_LEVEL", "WARN"))
     return spark
 
-# ---------------------- Config via env vars ----------------------
+#Config via env vars
 BULL_TH = float(os.environ.get("RQ3_BULL_TH", "0.10"))  # +10%
 BEAR_TH = float(os.environ.get("RQ3_BEAR_TH", "0.10"))  # -10% (abs)
 
@@ -81,7 +81,7 @@ BTC_SYMBOL = os.environ.get("RQ3_BTC_SYMBOL", "BTC-USDT")
 
 OUT_BASE = os.environ.get("RQ3_OUT", derived_path("rq3_results"))
 
-# ---------------------- Helpers ----------------------
+#Helpers
 def is_leveraged_symbol(col_sym):
     u = F.upper(col_sym)
     return u.contains("UP") | u.contains("DOWN") | u.contains("BULL") | u.contains("BEAR")
@@ -110,7 +110,7 @@ def compute_beta(df, group_cols: List[str], y_col: str, x_col: str, min_rows: in
     )
     return agg
 
-# ---------------------- Main ----------------------
+#Main
 def main():
     spark = ensure_spark("rq3_btc_hypersensitivity")
 
@@ -146,7 +146,7 @@ def main():
         "open_time", "symbol", "base_asset", "quote_asset", F.col("log_return").alias("ret")
     )
 
-    # -------------------- Regime definition: BTC 30d return from DAILY close --------------------
+    #Regime definition: BTC 30d return from DAILY close
     btc_daily = btc.withColumn("date", F.to_date("open_time")) \
                    .withColumn("ts", F.col("open_time").cast("timestamp"))
 
@@ -193,7 +193,7 @@ def main():
 
     joined = receivers.join(btc.select("open_time", "btc_ret"), on="open_time", how="inner")
 
-    # -------------------- Betas --------------------
+    #Betas
     overall_beta = compute_beta(
         joined,
         group_cols=["symbol", "base_asset", "quote_asset"],
@@ -249,7 +249,7 @@ def main():
         .orderBy(F.col("delta_beta_bear_minus_bull").desc())
     )
 
-    # -------------------- Write outputs --------------------
+    #outputs
     print("Writing:", f"{OUT_BASE}/betas_overall")
     overall_beta.write.mode("overwrite").parquet(f"{OUT_BASE}/betas_overall")
 
@@ -268,7 +268,7 @@ def main():
     print("Writing:", f"{OUT_BASE}/top_delta_beta")
     top_delta.write.mode("overwrite").parquet(f"{OUT_BASE}/top_delta_beta")
 
-    # -------------------- Terminal previews --------------------
+    #previews
     print("\nRQ3: Regime beta summary:")
     beta_regime_summary.show(truncate=False)
 
