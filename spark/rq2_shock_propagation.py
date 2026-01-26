@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
 RQ2: Shock propagation from BTC/ETH trading intensity to altcoin liquidity/volatility.
-
-We study how extreme trading-intensity shocks in BTC and ETH propagate
-to volatility and liquidity of smaller cryptocurrencies at different time lags.
 """
 
 import os
