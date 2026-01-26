@@ -31,7 +31,7 @@ except Exception:
     from spark.config import raw_path  # type: ignore
 
 
-# -------------------- SETTINGS --------------------
+#settigns
 STRESS_Q = float(os.environ.get("STRESS_Q", "0.95"))  # BTC stress percentile threshold
 LOCAL_MAX_FILES = int(os.environ.get("LOCAL_MAX_FILES", "0"))  # 0 = all local files
 
@@ -70,15 +70,11 @@ def ensure_spark(app: str) -> SparkSession:
 
 
 def select_input_files_for_local(path: str) -> str:
-    """
-    If LOCAL_MAX_FILES > 0, read only that many parquet files locally.
-    This prevents your laptop from trying to read 1000 files at once.
-    """
+    #If LOCAL_MAX_FILES > 0, read only that many parquet files locally.
     if not IS_LOCAL or LOCAL_MAX_FILES <= 0:
         return path
 
-    # Path is a folder with many parquet files
-    # We'll list them with Hadoop filesystem API via Spark
+    #lsit them with Hadoop filesystem API via Spark
     spark = SparkSession.getActiveSession()
     if spark is None:
         return path
@@ -104,7 +100,7 @@ def select_input_files_for_local(path: str) -> str:
         return path
 
     print(f"Local mode: reading {len(files)} parquet files (LOCAL_MAX_FILES={LOCAL_MAX_FILES})")
-    # spark.read.parquet can accept multiple paths
+    #spark.read.parquet can accept multiple paths
     return ",".join(files)
 
 
@@ -118,17 +114,16 @@ def main():
 
     df = spark.read.parquet(in_path)
 
-    # -------------------- STEP 1: Define tiers --------------------
-    # Why: we need a consistent grouping variable (Large vs Small).
+    #defining tiers (large cap vs small cap)
     df = df.withColumn(
         "tier",
         F.when(F.col("base_asset").isin([x.strip() for x in LARGE_CAP_BASE]), F.lit("LARGE_CAP"))
          .otherwise(F.lit("SMALL_CAP"))
     )
 
-    # -------------------- STEP 2: Define market stress using BTC volatility --------------------
-    # Why: BTC is the primary market benchmark; its volatility spikes represent market-wide stress.
-    # We prefer BTC-USDT if present; otherwise any BTC-*.
+    #2. Define market stress
+    #BTC is the primary market benchmark; its volatility spikes represent market-wide stress.
+    #prefer BTC-USDT if present; otherwise any BTC-*.
     btc = (
         df.filter(F.col("symbol").startswith("BTC-"))
           .withColumn(
@@ -157,13 +152,12 @@ def main():
     # join stress flag to all assets by minute
     df = df.join(btc_1.select("open_time", "is_stress"), on="open_time", how="left")
 
-    # -------------------- STEP 3: Aggregate metrics by (tier, is_stress) --------------------
-    # Why each metric:
-    # - quote_asset_volume: activity/liquidity proxy in quote currency (USDT/BUSD/etc)
-    # - zero_volume_ratio: market "breakdown" frequency
-    # - amihud_illiq: price impact proxy (higher = worse liquidity)
-    # - parkinson_var_1m: range-based volatility proxy
-    # - abs(log_return): directionless volatility magnitude proxy
+    #3. Aggregate metrics
+    #quote_asset_volume: activity/liquidity proxy in quote currency (USDT/BUSD/etc)
+    #zero_volume_ratio: market "breakdown" frequency
+    #amihud_illiq: price impact proxy (higher = worse liquidity)
+    #parkinson_var_1m: range-based volatility proxy
+    #abs(log_return): directionless volatility magnitude proxy
     agg = (
         df.groupBy("tier", "is_stress")
           .agg(
