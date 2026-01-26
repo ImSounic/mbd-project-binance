@@ -1,24 +1,6 @@
 #!/usr/bin/env python3
 """
 RQ3: Hyper-sensitivity to Bitcoin price movements + regime comparison (Bull vs Bear)
-
-Option 1 (implemented now):
-- Regimes defined by BTC 30-day return using DAILY BTC close:
-    bull if 30d_return >= +BULL_TH
-    bear if 30d_return <= -BEAR_TH
-    neutral otherwise
-
-Model:
-    r_i,t = alpha_i + beta_i * r_btc,t + eps_i,t
-beta computed via closed-form OLS:
-    beta = cov(x,y)/var(x)
-
-Outputs written to derived/rq3_results/* (HDFS on cluster, local path locally).
-
-Filters:
-- Excludes leveraged tokens containing UP/DOWN/BULL/BEAR in symbol (default on)
-- Keeps quote assets USDT/USDC/USD/EUR (default)
-- Optionally excludes XXX-BTC by excluding quote_asset == BTC (default on)
 """
 
 import os
@@ -28,7 +10,6 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql import Window
 
-# ---------------------- Paths + Spark builder (self-contained) ----------------------
 def is_hdfs_path(p: str) -> bool:
     return p.startswith("hdfs://") or p.startswith("/user/") or p.startswith("viewfs://")
 
