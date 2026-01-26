@@ -1,21 +1,9 @@
 #!/usr/bin/env python3
 """
-RQ1 Visualisations
-------------------
+RQ1 Visualisations:
 Creates PNG figures for RQ1, using:
 - Summary results from rq1_compare (small table)
 - Optional sampled distributions from features_1m (to show spread/tails)
-
-Outputs:
-- PNGs saved to local folder:
-    data/results/rq1_figures   (IS_LOCAL=True)
-    rq1_figures                (cluster driver local FS)
-- If running on cluster, also uploads to HDFS:
-    hdfs:///user/<owner>/binance/results/rq1_figures
-
-Why this matters in the report:
-- Tables show averages; plots show distributions and tail risk.
-- Stress vs non-stress comparison is the "amplification" evidence.
 """
 
 import os
@@ -26,14 +14,13 @@ import matplotlib.pyplot as plt
 
 from pyspark.sql import SparkSession, functions as F, Window
 
-# ---- config import ----
 try:
     from config import IS_LOCAL, DATA_DERIVED, DATA_RESULTS
 except Exception:
     from spark.config import IS_LOCAL, DATA_DERIVED, DATA_RESULTS  # type: ignore
 
 
-# -------------------- SETTINGS --------------------
+#settings
 MAX_PLOT_POINTS = int(os.environ.get("MAX_PLOT_POINTS", "200000"))
 SAMPLE_FRACTION = float(os.environ.get("SAMPLE_FRACTION", "0.001"))  # distribution sampling
 LOCAL_MAX_FILES = int(os.environ.get("LOCAL_MAX_FILES", "0"))
@@ -96,10 +83,7 @@ def select_input_files_for_local(path: str) -> str:
     return ",".join(files)
 
 
-def save_barplot(df_pd, x, y, hue, title, ylabel, out_file, logy=False):
-    """
-    Simple grouped bar chart using pandas DataFrame produced from Spark aggregation.
-    """
+def save_barplot(df_pd, x, y, hue, title, ylabel, out_file, logy=False):ark aggregation.
     # Pivot to make grouped bars easy
     pivot = df_pd.pivot(index=x, columns=hue, values=y)
 
@@ -140,9 +124,6 @@ def save_boxplot(sample_pd, value_col, group_cols, title, ylabel, out_file, logy
 
 
 def maybe_upload_to_hdfs(local_dir: str, hdfs_dir: str):
-    """
-    Upload PNGs to HDFS when on cluster.
-    """
     if IS_LOCAL:
         return
 
