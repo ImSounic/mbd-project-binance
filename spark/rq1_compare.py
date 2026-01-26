@@ -1,35 +1,20 @@
 #!/usr/bin/env python3
 """
-RQ1 Compare: Stress vs Non-Stress
---------------------------------
+RQ1 Compare: Stress vs Non-Stress:
 Computes liquidity/volatility metrics by tier for:
 - Stress periods (BTC volatility in top X%)
 - Non-stress periods (everything else)
-
-Writes:
-- Parquet summary to results (or local folder when IS_LOCAL=True)
-- CSV summary (single file) for quick viewing
-
-Why each step (report-friendly):
-- We define stress using BTC volatility as BTC is market-wide benchmark.
-- We assign tiers (Large vs Small cap) to compare market quality under stress.
-- We aggregate multiple complementary liquidity/volatility proxies:
-  volume (activity), zero-volume (market breakdown), Amihud (price impact),
-  Parkinson (range-based vol), abs return (directionless volatility).
 """
 
 import os
 from pyspark.sql import SparkSession, functions as F, Window
 
-# ---- config import (works whether config.py is at repo root or under spark/) ----
 try:
     from config import IS_LOCAL, DATA_DERIVED, DATA_RESULTS, DATA_RAW_LOCAL, DATA_RAW
-    from config import raw_path  # if you already have it
+    from config import raw_path 
 except Exception:
-    # fallback if your config is spark/config.py and you run from repo root
-    from spark.config import IS_LOCAL, DATA_DERIVED, DATA_RESULTS, DATA_RAW_LOCAL, DATA_RAW  # type: ignore
-    from spark.config import raw_path  # type: ignore
-
+    from spark.config import IS_LOCAL, DATA_DERIVED, DATA_RESULTS, DATA_RAW_LOCAL, DATA_RAW 
+    from spark.config import raw_path  
 
 #settigns
 STRESS_Q = float(os.environ.get("STRESS_Q", "0.95"))  # BTC stress percentile threshold
